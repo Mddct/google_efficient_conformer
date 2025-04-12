@@ -23,4 +23,15 @@
       url={https://arxiv.org/abs/2204.06164}, 
 }
 ```
+```
+@misc{narayanan2020cascadedencodersunifyingstreaming,
+      title={Cascaded encoders for unifying streaming and non-streaming ASR}, 
+      author={Arun Narayanan and Tara N. Sainath and Ruoming Pang and Jiahui Yu and Chung-Cheng Chiu and Rohit Prabhavalkar and Ehsan Variani and Trevor Strohman},
+      year={2020},
+      eprint={2010.14606},
+      archivePrefix={arXiv},
+      primaryClass={eess.AS},
+      url={https://arxiv.org/abs/2010.14606}, 
+}
+```
 

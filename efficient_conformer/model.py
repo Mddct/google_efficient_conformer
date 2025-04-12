@@ -69,29 +69,20 @@ class ConformerNoAttEncoderLayer(torch.nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        mask: torch.Tensor,
         mask_pad: torch.Tensor = torch.ones((0, 0, 0), dtype=torch.bool),
         cnn_cache: torch.Tensor = torch.zeros((0, 0, 0, 0)),
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute encoded features.
 
         Args:
             x (torch.Tensor): (#batch, time, size)
-            mask (torch.Tensor): Mask tensor for the input (#batch, time，time),
                 (0, 0, 0) means fake mask.
-            pos_emb (torch.Tensor): positional encoding, must not be None
-                for ConformerEncoderLayer.
             mask_pad (torch.Tensor): batch padding mask used for conv module.
                 (#batch, 1，time), (0, 0, 0) means fake mask.
-            att_cache (torch.Tensor): Cache tensor of the KEY & VALUE
-                (#batch=1, head, cache_t1, d_k * 2), head * d_k == size.
             cnn_cache (torch.Tensor): Convolution cache in conformer layer
                 (#batch=1, size, cache_t2)
         Returns:
             torch.Tensor: Output tensor (#batch, time, size).
-            torch.Tensor: Mask tensor (#batch, time, time).
-            torch.Tensor: att_cache tensor,
-                (#batch=1, head, cache_t1 + time, d_k * 2).
             torch.Tensor: cnn_cahce tensor (#batch, size, cache_t2).
         """
 
@@ -133,7 +124,7 @@ class ConformerNoAttEncoderLayer(torch.nn.Module):
         if self.conv_module is not None:
             x = self.norm_final(x)
 
-        return x, mask, new_cnn_cache
+        return x, new_cnn_cache
 
 
 class ConformerNoPosEncoderLayer(ConformerEncoderLayer):
@@ -282,7 +273,7 @@ class Conformer(torch.nn.Module):
             ) for _ in range(config.first_n_layers)
         ])
 
-        self.encoders = torch.nn.ModuleList([
+        self.causal_encoders = torch.nn.ModuleList([
             ConformerNoPosEncoderLayer(
                 config.output_size,
                 WENET_ATTENTION_CLASSES[config.selfattention_layer_type](
@@ -296,7 +287,24 @@ class Conformer(torch.nn.Module):
                 config.normalize_before,
                 layer_norm_type=config.layer_norm_type,
                 norm_eps=config.norm_eps,
-            ) for _ in range(config.num_blocks)
+            ) for _ in range(config.causal_blocks)
+        ])
+
+        self.noncausal_encoders = torch.nn.ModuleList([
+            ConformerNoPosEncoderLayer(
+                config.output_size,
+                WENET_ATTENTION_CLASSES[config.selfattention_layer_type](
+                    *encoder_selfattn_layer_args),
+                mlp_class(*positionwise_layer_args),
+                mlp_class(*positionwise_layer_args)
+                if config.macaron_style else None,
+                ConvolutionModule(*convolution_layer_args)
+                if config.use_cnn_module else None,
+                config.dropout_rate,
+                config.normalize_before,
+                layer_norm_type=config.layer_norm_type,
+                norm_eps=config.norm_eps,
+            ) for _ in range(config.noncausal_blocks)
         ])
 
         self.after_norm = WENET_NORM_CLASSES[config.layer_norm_type](
@@ -307,15 +315,20 @@ class Conformer(torch.nn.Module):
         """ Forward for training
         """
         masks = ~make_pad_mask(xs_lens).unsqueeze(1)
-        att_mask = causal_or_lookahead_mask(masks, self.config.right_context,
-                                            self.config.left_context)
+        causal_att_mask = causal_or_lookahead_mask(masks, 0,
+                                                   self.config.left_context)
+        noncausal_att_mask = causal_or_lookahead_mask(
+            masks, self.config.right_context, self.config.left_context)
         mask_pad = masks
         if self.config.use_sdpa:
-            att_mask = mask_to_bias(att_mask, xs.dtype)
+            noncausal_att_mask = mask_to_bias(noncausal_att_mask, xs.dtype)
+            causal_att_mask = mask_to_bias(causal_att_mask, xs.dtype)
         if self.config.gradient_checkpointing and self.training:
-            xs = self.forward_layers_checkpointed(xs, att_mask, mask_pad)
+            xs = self.forward_layers_checkpointed(xs, causal_att_mask,
+                                                  noncausal_att_mask, mask_pad)
         else:
-            xs = self.forward_layers(xs, att_mask, mask_pad)
+            xs = self.forward_layers(xs, causal_att_mask, noncausal_att_mask,
+                                     mask_pad)
         if self.config.final_norm:
             xs = self.after_norm(xs)
         # Here we assume the mask is not changed in encoder layers, so just
@@ -323,31 +336,41 @@ class Conformer(torch.nn.Module):
         # for cross attention with decoder later
         return xs, masks
 
-    def forward_layers(self, xs: torch.Tensor, chunk_masks: torch.Tensor,
+    def forward_layers(self, xs: torch.Tensor,
+                       causal_chunk_masks: torch.Tensor,
+                       noncausal_chunk_masks: torch.Tensor,
                        mask_pad: torch.Tensor) -> torch.Tensor:
+
         for layer in self.first_n_encoders:
-            xs, chunk_masks, _ = layer(xs, chunk_masks, mask_pad)
-
-        for layer in self.encoders:
-            xs, chunk_masks, _, _ = layer(xs, chunk_masks, mask_pad)
-
+            xs, _ = layer(xs, mask_pad)
+        for layer in self.causal_encoders:
+            xs, _, _, _ = layer(xs, causal_chunk_masks, mask_pad)
+        for layer in self.noncausal_encoders:
+            xs, _, _, _ = layer(xs, noncausal_chunk_masks, mask_pad)
         return xs
 
     def forward_layers_checkpointed(self, xs: torch.Tensor,
-                                    chunk_masks: torch.Tensor,
+                                    causal_chunk_masks: torch.Tensor,
+                                    noncausal_chunk_masks: torch.Tensor,
                                     mask_pad: torch.Tensor) -> torch.Tensor:
         for layer in self.first_n_encoders:
-            xs, chunk_masks, _ = ckpt.checkpoint(layer.__call__,
-                                                 xs,
-                                                 chunk_masks,
-                                                 mask_pad,
-                                                 use_reentrant=False)
-        for layer in self.encoders:
-            xs, chunk_masks, _, _ = ckpt.checkpoint(layer.__call__,
-                                                    xs,
-                                                    chunk_masks,
-                                                    mask_pad,
-                                                    use_reentrant=False)
+            xs, _ = ckpt.checkpoint(layer.__call__,
+                                    xs,
+                                    mask_pad,
+                                    use_reentrant=False)
+        for layer in self.causal_encoders:
+            xs, _, _, _ = ckpt.checkpoint(layer.__call__,
+                                          xs,
+                                          causal_chunk_masks,
+                                          mask_pad,
+                                          use_reentrant=False)
+        for layer in self.noncausal_encoders:
+            xs, _, _, _ = ckpt.checkpoint(layer.__call__,
+                                          xs,
+                                          noncausal_chunk_masks,
+                                          mask_pad,
+                                          use_reentrant=False)
+
         return xs
 
 
@@ -355,7 +378,7 @@ if __name__ == '__main__':
     from efficient_conformer.configs.default import get_config
 
     config = get_config()
-    config.gradient_checkpointing = True
+    config.gradient_checkpointing = False
     model = Conformer(config)
 
     print(model)
