@@ -311,10 +311,10 @@ class Conformer(torch.nn.Module):
             config.output_size, config.norm_eps)
         self.config = config
 
-    def forward(self, xs: torch.Tensor, xs_lens: torch.Tensor):
+    def forward(self, xs: torch.Tensor, masks: torch.Tensor):
         """ Forward for training
         """
-        masks = ~make_pad_mask(xs_lens).unsqueeze(1)
+        masks = masks.unsqueeze(1) # (B,1,T)
         causal_att_mask = causal_or_lookahead_mask(masks, 0,
                                                    self.config.left_context)
         noncausal_att_mask = causal_or_lookahead_mask(
@@ -385,6 +385,7 @@ if __name__ == '__main__':
 
     xs = torch.rand(2, 100, 256)
     xs_lens = torch.tensor([10, 100])
-
-    out, mask = model(xs, xs_lens)
+    masks = ~make_pad_mask(xs_lens)
+  
+    out, mask = model(xs, masks)
     print(out, mask.sum(-1))
