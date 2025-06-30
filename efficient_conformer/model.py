@@ -13,8 +13,8 @@ from wenet.utils.common import mask_to_bias
 from wenet.utils.mask import causal_or_lookahead_mask, make_pad_mask
 
 
-# https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/modular_gemma3n.py
-class Gemma3nAudioCumulativeGroupNorm(torch.nn.Module):
+# modified from https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/modular_gemma3n.py
+class CumulativeGroupNorm(torch.nn.Module):
     """Applies Group Normalization cumulatively over the time dimension.
 
     This layer normalizes the input by calculating the mean and variance
@@ -50,11 +50,14 @@ class Gemma3nAudioCumulativeGroupNorm(torch.nn.Module):
         # For input [B, T, *feature_dims, C], these are dims from 2 onwards.
         self.reduction_axes = tuple(range(2, 2 + len(self.feature_dims) + 1))
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self,
+                hidden_states: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Applies cumulative group norm, optionally using a mask.
 
         Args:
           hidden_states: Input tensor, shape [B, T, *feature_dims, C].
+          mask: Mask tensor, shape [B,T,1,1]
 
         Returns:
           Normalized tensor with the same shape as x.
@@ -75,7 +78,10 @@ class Gemma3nAudioCumulativeGroupNorm(torch.nn.Module):
         # If no mask is provided, treat all elements as valid
         # (mask_calc is all ones).
         # Otherwise, expand the [B, T] mask to [B, T, 1, ..., 1] for broadcasting.
-        mask_calc = torch.ones_like(x_calc, dtype=calc_dtype)
+        if mask is None:
+            mask_calc = torch.ones_like(x_calc, dtype=calc_dtype)
+        else:
+            mask_calc = mask.repeat(1, 1, x_calc.shape[-2], x_calc.shape[-1])
 
         # Cumulative Statistics Calculation
         # 1. Sum of values over reduction axes at each time step.
