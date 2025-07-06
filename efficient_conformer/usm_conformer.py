@@ -7,7 +7,19 @@ T_CACHE = Tuple[torch.Tensor, torch.Tensor]
 Config = Any
 
 
+def mask_to_bias(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    assert mask.dtype == torch.bool
+    assert dtype in [torch.float32, torch.bfloat16, torch.float16]
+    mask = mask.to(dtype)
+    # attention mask bias
+    # NOTE(Mddct): torch.finfo jit issues
+    #     chunk_masks = (1.0 - chunk_masks) * torch.finfo(dtype).min
+    mask = (1.0 - mask) * -1.0e+10
+    return mask
+
+
 # copy from:https://github.com/google/gemma_pytorch/blob/main/gemma/model.py#L84
+#
 def precompute_freqs_cis(dim: int,
                          end: int,
                          theta: float = 10000.0) -> torch.Tensor:
@@ -447,13 +459,14 @@ class AudioConformerAttention(torch.nn.Module):
         self.pre_attn_norm = RMSNorm(self.config.hidden_size)
         self.attn = RopeMultiHeadedAttention(
             config.n_head,
-            config.n_feat,
+            config.hidden_size,
             config.dropout_rate,
             config.query_bias,
             config.key_bias,
             config.value_bias,
             config.use_sdpa,
             config.n_kv_head,
+            head_dim=config.head_dim,
         )
         self.post = torch.nn.Linear(self.post_in_features,
                                     self.config.hidden_size,
@@ -471,7 +484,6 @@ class AudioConformerAttention(torch.nn.Module):
                                                 audio_encodings_norm,
                                                 audio_encodings_norm, xs_mask,
                                                 pos_emb)
-
         audio_encodings = self.post(audio_encodings_attn_out)
         audio_encodings = torch.clamp(audio_encodings, -self.gradient_clipping,
                                       self.gradient_clipping)
@@ -499,11 +511,11 @@ class MLP(torch.nn.Module):
                                     bias=False)
         # w_1 as up proj
         self.w_1 = torch.nn.Linear(config.hidden_size,
-                                   4 * config.hidden_units,
+                                   4 * config.hidden_size,
                                    bias=False)
         # w_2 as down proj
-        self.w_2 = torch.nn.Linear(4 * config.hidden_units,
-                                   config.idim,
+        self.w_2 = torch.nn.Linear(4 * config.hidden_size,
+                                   config.hidden_size,
                                    bias=False)
 
         self.post_layer_norm = RMSNorm(self.config.hidden_size)
@@ -523,10 +535,10 @@ class MLP(torch.nn.Module):
         gate = torch.nn.functional.gelu(self.gate(x))
         up = self.w_1(x)
         fuse = gate * up
-        fuse = torch.clamp(fuse, -self.gradient_clipping,
-                           self.gradient_clipping)
+        out = self.w_2(fuse)
+        out = torch.clamp(out, -self.gradient_clipping, self.gradient_clipping)
 
-        out = self.post_layer_norm(fuse)
+        out = self.post_layer_norm(out)
         return residual + self.post_layer_scale * out
 
 
@@ -605,7 +617,7 @@ class AudioConformerBlock(torch.nn.Module):
                 x_mask: torch.Tensor, pos_emb: torch.Tensor) -> torch.Tensor:
         audio_encodings = self.ffw_layer_start(x)
         audio_encodings = self.attention(audio_encodings, x_att_mask, pos_emb)
-        validity_mask_for_lconv = x_mask  # True for valid
+        validity_mask_for_lconv = x_mask[:, :, None]  # True for valid
         audio_encodings_for_lconv_input = audio_encodings * validity_mask_for_lconv.to(
             audio_encodings.dtype)
         audio_encodings = self.lconv1d(audio_encodings_for_lconv_input)
@@ -893,23 +905,22 @@ class AudioConformer(torch.nn.Module):
     """An audio encoder based on the [Universal Speech Model](https://arxiv.org/abs/2303.01037) architecture."""
 
     def __init__(self, config: Config):
-        super().__init__(config)
+        super().__init__()
         self.config = config
 
         self.subsample_conv_projection = AudioSubSampleConvProjection(config)
         self.conformer = torch.nn.ModuleList([
             AudioConformerBlock(config)
-            for _ in range(config.conf_num_hidden_layers)
+            for _ in range(config.num_hidden_layers)
         ])
-
-        pe = precompute_freqs_cis(config.hidden_size, config.rope_mas_lens,
+        pe = precompute_freqs_cis(config.head_dim, config.rope_max_lens,
                                   config.rope_theta)
         self.register_buffer('pe', pe)
 
     def forward(
         self, audio_mel: torch.Tensor, audio_mel_mask: torch.BoolTensor
     ) -> tuple[torch.Tensor, torch.BoolTensor]:
-        """Encodes a batch of MELs.
+        """Encodes a batch of MELs (training only).
 
         Args:
             audio_mel: a torch.Tensor of shape [batch, num_frames, num_channels,
@@ -951,13 +962,17 @@ class AudioConformer(torch.nn.Module):
             indices = indices.unsqueeze(0)
 
         current_mask = torch.gather(audio_mel_mask, 1, indices)  # [B, T_sub]
+        pe = self.pe[None, :current_mask.shape[1],
+                     None, :]  # [1, seq, q, head_dim // 2]
         # TODO: streaming mask
-        att_mask = current_mask.squeeze(1)
+        att_mask = current_mask[:, :, None]
+        if config.use_sdpa:
+            att_mask = mask_to_bias(att_mask, audio_encodings.dtype)
 
         audio_encodings: torch.Tensor
         for block in self.conformer:
             audio_encodings = block(audio_encodings, att_mask, current_mask,
-                                    self.pe)  # Pass the processed mask
+                                    pe)  # Pass the processed mask
 
         if self.config.conf_reduction_factor > 1:
             audio_encodings = audio_encodings[:, ::self.config.
@@ -965,6 +980,22 @@ class AudioConformer(torch.nn.Module):
             # Reduce the mask as well
             current_mask = current_mask[:, ::self.config.conf_reduction_factor]
 
-        audio_encodings = audio_encodings.masked_fill(
-            current_mask.unsqueeze(-1), 0.0)
+        audio_encodings = audio_encodings * current_mask[:, :, None]
         return audio_encodings, current_mask
+
+
+if __name__ == '__main__':
+    from configs.default import get_config
+    config = get_config()
+
+    model = AudioConformer(config)
+    print(model)
+    num_params = sum(p.numel() for p in model.parameters())
+    print('the number of model params: {:,d}'.format(num_params))
+
+    input = torch.randn(2, 100, config.input_feat_size)
+    mask = torch.ones(2, 100, dtype=torch.bool)
+
+    out, out_mask = model(input, mask)
+    print(out)
+    print(out_mask.shape, out.shape)
